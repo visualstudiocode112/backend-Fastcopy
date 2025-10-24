@@ -342,22 +342,47 @@ async def list_content(page: int = 1, per_page: int = 20, q: Optional[str] = Non
 
     Returns a JSON object: { items: [...], total: <int>, page: <int>, per_page: <int> }
     """
-    filter_query = {}
-    if q:
-        # simple case-insensitive partial match on title or overview
-        filter_query['$or'] = [
-            { 'title': { '$regex': q, '$options': 'i' } },
-            { 'overview': { '$regex': q, '$options': 'i' } }
-        ]
-    if content_type:
-        filter_query['content_type'] = content_type
+    try:
+        logging.info(f"Requesting content list - page:{page} per_page:{per_page} content_type:{content_type}")
+        
+        filter_query = {}
+        if q:
+            # simple case-insensitive partial match on title or overview
+            filter_query['$or'] = [
+                { 'title': { '$regex': q, '$options': 'i' } },
+                { 'overview': { '$regex': q, '$options': 'i' } }
+            ]
+        if content_type:
+            filter_query['content_type'] = content_type
 
-    # determine sort field
-    sort_field = "created_at"
-    if sort_by == "release_date":
-        sort_field = "release_date"
+        # determine sort field
+        sort_field = "created_at"
+        if sort_by == "release_date":
+            sort_field = "release_date"
+            
+        logging.info(f"MongoDB query: {filter_query}")
+        
+        # Verify MongoDB connection
+        await db.admin.command('ping')
 
-    total = await db.content.count_documents(filter_query)
+        total = await db.content.count_documents(filter_query)
+        
+        if total == 0:
+            logging.warning("No content found in database")
+            return {
+                "items": [],
+                "total": 0,
+                "page": page,
+                "per_page": per_page,
+                "message": "No hay contenido disponible en este momento"
+            }
+            
+    except Exception as e:
+        logging.error(f"Error accessing MongoDB: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Error al acceder a la base de datos"
+        )
     skip = max(0, (page - 1)) * per_page
     cursor = db.content.find(filter_query, {"_id": 0}).sort(sort_field, -1).skip(skip).limit(per_page)
     items = await cursor.to_list(per_page)
