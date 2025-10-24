@@ -328,11 +328,45 @@ async def add_content(content_data: ContentCreate, current_user: dict = Depends(
 
 @api_router.get("/content", response_model=List[Content])
 async def get_all_content():
+    # Legacy endpoint: return up to 1000 items (kept for backward compatibility)
     content_list = await db.content.find({}, {"_id": 0}).to_list(1000)
     for item in content_list:
         if isinstance(item['created_at'], str):
             item['created_at'] = datetime.fromisoformat(item['created_at'])
     return content_list
+
+
+@api_router.get("/content/list")
+async def list_content(page: int = 1, per_page: int = 20, q: Optional[str] = None, content_type: Optional[str] = None, sort_by: str = "created_at"):
+    """Paginated content listing with optional search and filtering by content_type.
+
+    Returns a JSON object: { items: [...], total: <int>, page: <int>, per_page: <int> }
+    """
+    filter_query = {}
+    if q:
+        # simple case-insensitive partial match on title or overview
+        filter_query['$or'] = [
+            { 'title': { '$regex': q, '$options': 'i' } },
+            { 'overview': { '$regex': q, '$options': 'i' } }
+        ]
+    if content_type:
+        filter_query['content_type'] = content_type
+
+    # determine sort field
+    sort_field = "created_at"
+    if sort_by == "release_date":
+        sort_field = "release_date"
+
+    total = await db.content.count_documents(filter_query)
+    skip = max(0, (page - 1)) * per_page
+    cursor = db.content.find(filter_query, {"_id": 0}).sort(sort_field, -1).skip(skip).limit(per_page)
+    items = await cursor.to_list(per_page)
+    # normalize created_at
+    for item in items:
+        if isinstance(item.get('created_at'), str):
+            item['created_at'] = datetime.fromisoformat(item['created_at'])
+
+    return { 'items': items, 'total': total, 'page': page, 'per_page': per_page }
 
 @api_router.get("/content/{content_id}", response_model=Content)
 async def get_content_by_id(content_id: str):
