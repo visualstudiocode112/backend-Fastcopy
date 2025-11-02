@@ -328,70 +328,11 @@ async def add_content(content_data: ContentCreate, current_user: dict = Depends(
 
 @api_router.get("/content", response_model=List[Content])
 async def get_all_content():
-    # Legacy endpoint: return up to 1000 items (kept for backward compatibility)
     content_list = await db.content.find({}, {"_id": 0}).to_list(1000)
     for item in content_list:
         if isinstance(item['created_at'], str):
             item['created_at'] = datetime.fromisoformat(item['created_at'])
     return content_list
-
-
-@api_router.get("/content/list")
-async def list_content(page: int = 1, per_page: int = 20, q: Optional[str] = None, content_type: Optional[str] = None, sort_by: str = "created_at"):
-    """Paginated content listing with optional search and filtering by content_type.
-
-    Returns a JSON object: { items: [...], total: <int>, page: <int>, per_page: <int> }
-    """
-    try:
-        logging.info(f"Requesting content list - page:{page} per_page:{per_page} content_type:{content_type}")
-        
-        filter_query = {}
-        if q:
-            # simple case-insensitive partial match on title or overview
-            filter_query['$or'] = [
-                { 'title': { '$regex': q, '$options': 'i' } },
-                { 'overview': { '$regex': q, '$options': 'i' } }
-            ]
-        if content_type:
-            filter_query['content_type'] = content_type
-
-        # determine sort field
-        sort_field = "created_at"
-        if sort_by == "release_date":
-            sort_field = "release_date"
-            
-        logging.info(f"MongoDB query: {filter_query}")
-        
-        # Verify MongoDB connection
-        await db.admin.command('ping')
-
-        total = await db.content.count_documents(filter_query)
-        
-        if total == 0:
-            logging.warning("No content found in database")
-            return {
-                "items": [],
-                "total": 0,
-                "page": page,
-                "per_page": per_page,
-                "message": "No hay contenido disponible en este momento"
-            }
-            
-    except Exception as e:
-        logging.error(f"Error accessing MongoDB: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Error al acceder a la base de datos"
-        )
-    skip = max(0, (page - 1)) * per_page
-    cursor = db.content.find(filter_query, {"_id": 0}).sort(sort_field, -1).skip(skip).limit(per_page)
-    items = await cursor.to_list(per_page)
-    # normalize created_at
-    for item in items:
-        if isinstance(item.get('created_at'), str):
-            item['created_at'] = datetime.fromisoformat(item['created_at'])
-
-    return { 'items': items, 'total': total, 'page': page, 'per_page': per_page }
 
 @api_router.get("/content/{content_id}", response_model=Content)
 async def get_content_by_id(content_id: str):
@@ -402,6 +343,89 @@ async def get_content_by_id(content_id: str):
     if isinstance(content['created_at'], str):
         content['created_at'] = datetime.fromisoformat(content['created_at'])
     return content
+
+
+# ========== AUTOCOMPLETE ROUTES ==========
+@api_router.get("/autocomplete/genres")
+async def autocomplete_genres(q: str = "", limit: int = 10):
+    """Return distinct genres matching prefix q (case-insensitive)"""
+    if not q:
+        # return top genres by frequency
+        pipeline = [
+            {"$unwind": "$genres"},
+            {"$group": {"_id": "$genres", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": limit}
+        ]
+        res = await db.content.aggregate(pipeline).to_list(limit)
+        return [r['_id'] for r in res]
+
+    regex = {"$regex": f"^{q}", "$options": "i"}
+    pipeline = [
+        {"$unwind": "$genres"},
+        {"$match": {"genres": regex}},
+        {"$group": {"_id": "$genres", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": limit}
+    ]
+    res = await db.content.aggregate(pipeline).to_list(limit)
+    return [r['_id'] for r in res]
+
+
+@api_router.get("/autocomplete/actors")
+async def autocomplete_actors(q: str = "", limit: int = 10):
+    """Return distinct actors matching prefix q (case-insensitive). Assumes content documents may have 'actors' array or string."""
+    if not q:
+        pipeline = [
+            {"$project": {"actors": 1}},
+            {"$unwind": {"path": "$actors", "preserveNullAndEmptyArrays": False}},
+            {"$group": {"_id": "$actors", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": limit}
+        ]
+        res = await db.content.aggregate(pipeline).to_list(limit)
+        return [r['_id'] for r in res]
+
+    regex = {"$regex": f"^{q}", "$options": "i"}
+    pipeline = [
+        {"$project": {"actors": 1}},
+        {"$unwind": {"path": "$actors", "preserveNullAndEmptyArrays": False}},
+        {"$match": {"actors": regex}},
+        {"$group": {"_id": "$actors", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": limit}
+    ]
+    res = await db.content.aggregate(pipeline).to_list(limit)
+    return [r['_id'] for r in res]
+
+
+# ========== FILTER LISTS (genres, years) ==========
+@api_router.get("/filters/genres")
+async def get_filter_genres():
+    """Return all distinct genres present in content, alphabetically sorted"""
+    pipeline = [
+        {"$unwind": "$genres"},
+        {"$group": {"_id": "$genres"}},
+        {"$sort": {"_id": 1}}
+    ]
+    res = await db.content.aggregate(pipeline).to_list(1000)
+    return [r['_id'] for r in res if r['_id']]
+
+
+@api_router.get("/filters/years")
+async def get_filter_years():
+    """Return distinct release years (YYYY) present in content, sorted desc"""
+    pipeline = [
+        {"$match": {"release_date": {"$exists": True, "$ne": ""}}},
+        {"$project": {"year": {"$substrBytes": ["$release_date", 0, 4]}}},
+        {"$group": {"_id": "$year"}},
+        {"$match": {"_id": {"$ne": None, "$ne": ""}}},
+        {"$sort": {"_id": -1}}
+    ]
+    res = await db.content.aggregate(pipeline).to_list(1000)
+    # Filter only numeric years
+    years = [r['_id'] for r in res if isinstance(r['_id'], str) and r['_id'].isdigit()]
+    return years
 
 @api_router.delete("/content/{content_id}")
 async def delete_content(content_id: str, current_user: dict = Depends(get_admin_user)):
